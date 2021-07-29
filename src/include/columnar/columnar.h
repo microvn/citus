@@ -212,13 +212,14 @@ extern MemoryContext ColumnarWritePerTupleContext(ColumnarWriteState *state);
 extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 											 TupleDesc tupleDescriptor,
 											 List *projectedColumnList,
-											 List *qualConditions);
+											 List *qualConditions,
+											 Snapshot snaphot);
 extern bool ColumnarReadNextRow(ColumnarReadState *state, Datum *columnValues,
 								bool *columnNulls, uint64 *rowNumber);
 extern void ColumnarRescan(ColumnarReadState *readState);
 extern bool ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 									   uint64 rowNumber, Datum *columnValues,
-									   bool *columnNulls, Snapshot snapshot);
+									   bool *columnNulls);
 extern void ColumnarEndRead(ColumnarReadState *state);
 extern void ColumnarResetRead(ColumnarReadState *readState);
 extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
@@ -254,7 +255,8 @@ extern void SaveChunkGroups(RelFileNode relfilenode, uint64 stripe,
 							List *chunkGroupRowCounts);
 extern StripeSkipList * ReadStripeSkipList(RelFileNode relfilenode, uint64 stripe,
 										   TupleDesc tupleDescriptor,
-										   uint32 chunkCount);
+										   uint32 chunkCount,
+										   Snapshot snapshot);
 extern StripeMetadata * FindNextStripeByRowNumber(Relation relation, uint64 rowNumber,
 												  Snapshot snapshot);
 extern StripeMetadata * FindStripeByRowNumber(Relation relation, uint64 rowNumber,

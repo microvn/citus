@@ -253,11 +253,11 @@ CreateColumnarScanMemoryContext(void)
  */
 static ColumnarReadState *
 init_columnar_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_needed,
-						 List *scanQual)
+						 List *scanQual, Snapshot snapshot)
 {
 	List *neededColumnList = NeededColumnsList(tupdesc, attr_needed);
 	ColumnarReadState *readState = ColumnarBeginRead(relation, tupdesc, neededColumnList,
-													 scanQual);
+													 scanQual, snapshot);
 
 	return readState;
 }
@@ -305,7 +305,8 @@ columnar_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlo
 		MemoryContext oldContext = MemoryContextSwitchTo(scan->scanContext);
 		scan->cs_readState =
 			init_columnar_read_state(scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
-									 scan->attr_needed, scan->scanQual);
+									 scan->attr_needed, scan->scanQual,
+									 scan->cs_base.rs_snapshot);
 		MemoryContextSwitchTo(oldContext);
 	}
 
@@ -501,13 +502,14 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 
 		scan->cs_readState = init_columnar_read_state(columnarRelation,
 													  slot->tts_tupleDescriptor,
-													  attr_needed, scanQual);
+													  attr_needed, scanQual,
+													  snapshot);
 		MemoryContextSwitchTo(oldContext);
 	}
 
 	uint64 rowNumber = tid_to_row_number(*tid);
 	if (!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber, slot->tts_values,
-									slot->tts_isnull, snapshot))
+									slot->tts_isnull))
 	{
 		return false;
 	}
@@ -796,9 +798,12 @@ columnar_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	int natts = OldHeap->rd_att->natts;
 	Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
 	List *projectedColumnList = NeededColumnsList(sourceDesc, attr_needed);
+
+	/* use SnapshotAny when re-writing table as heapAM does */
+	Snapshot snapshot = SnapshotAny;
 	ColumnarReadState *readState = ColumnarBeginRead(OldHeap, sourceDesc,
 													 projectedColumnList,
-													 NULL);
+													 NULL, snapshot);
 
 	Datum *values = palloc0(sourceDesc->natts * sizeof(Datum));
 	bool *nulls = palloc0(sourceDesc->natts * sizeof(bool));
@@ -906,7 +911,8 @@ LogRelationStats(Relation rel, int elevel)
 		StripeMetadata *stripe = lfirst(stripeMetadataCell);
 		StripeSkipList *skiplist = ReadStripeSkipList(relfilenode, stripe->id,
 													  RelationGetDescr(rel),
-													  stripe->chunkCount);
+													  stripe->chunkCount,
+													  GetTransactionSnapshot());
 		for (uint32 column = 0; column < skiplist->columnCount; column++)
 		{
 			bool attrDropped = tupdesc->attrs[column].attisdropped;
