@@ -254,7 +254,22 @@ init_columnar_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_n
 						 List *scanQual, Snapshot snapshot)
 {
 	Oid relfilenode = relation->rd_node.relNode;
-	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
+	bool flushedAny = FlushWriteStateForRelfilenode(relfilenode,
+													GetCurrentSubTransactionId());
+	bool cidUsedForModifications = false;
+	CommandId currentCommandId = GetCurrentCommandId(cidUsedForModifications);
+	if (flushedAny && snapshot != InvalidSnapshot &&
+		snapshot->curcid != InvalidCommandId &&
+		snapshot->curcid < currentCommandId)
+	{
+		/*
+		 * If we flushed any pending writes, then we should guarantee that
+		 * those writes are visible to us too. For this reason, if given
+		 * snapshot is not an invalid snapshot and its curcid is smaller than
+		 * current command id, then we set its curcid to current command id.
+		 */
+		snapshot->curcid = currentCommandId;
+	}
 
 	List *neededColumnList = NeededColumnsList(tupdesc, attr_needed);
 	ColumnarReadState *readState = ColumnarBeginRead(relation, tupdesc, neededColumnList,

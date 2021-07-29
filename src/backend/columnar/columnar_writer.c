@@ -267,7 +267,7 @@ ColumnarEndWrite(ColumnarWriteState *writeState)
 }
 
 
-void
+bool
 ColumnarFlushPendingWrites(ColumnarWriteState *writeState)
 {
 	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
@@ -283,7 +283,11 @@ ColumnarFlushPendingWrites(ColumnarWriteState *writeState)
 		writeState->stripeSkipList = NULL;
 
 		MemoryContextSwitchTo(oldContext);
+
+		return true;
 	}
+
+	return false;
 }
 
 

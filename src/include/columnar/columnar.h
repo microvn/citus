@@ -203,7 +203,7 @@ extern ColumnarWriteState * ColumnarBeginWrite(RelFileNode relfilenode,
 											   TupleDesc tupleDescriptor);
 extern uint64 ColumnarWriteRow(ColumnarWriteState *state, Datum *columnValues,
 							   bool *columnNulls);
-extern void ColumnarFlushPendingWrites(ColumnarWriteState *state);
+extern bool ColumnarFlushPendingWrites(ColumnarWriteState *state);
 extern void ColumnarEndWrite(ColumnarWriteState *state);
 extern bool ContainsPendingWrites(ColumnarWriteState *state);
 extern MemoryContext ColumnarWritePerTupleContext(ColumnarWriteState *state);
@@ -271,7 +271,7 @@ extern Datum columnar_relation_storageid(PG_FUNCTION_ARGS);
 extern ColumnarWriteState * columnar_init_write_state(Relation relation, TupleDesc
 													  tupdesc,
 													  SubTransactionId currentSubXid);
-extern void FlushWriteStateForRelfilenode(Oid relfilenode, SubTransactionId
+extern bool FlushWriteStateForRelfilenode(Oid relfilenode, SubTransactionId
 										  currentSubXid);
 extern void FlushWriteStateForAllRels(SubTransactionId currentSubXid, SubTransactionId
 									  parentSubXid);

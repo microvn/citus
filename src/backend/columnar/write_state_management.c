@@ -195,28 +195,33 @@ columnar_init_write_state(Relation relation, TupleDesc tupdesc,
 
 
 /*
- * Flushes pending writes for given relfilenode in the given subtransaction.
+ * Flushes pending writes for given relfilenode in the given subtransaction
+ * if any and returns true. If there are no such pending writes, then returns
+ * false.
  */
-void
+bool
 FlushWriteStateForRelfilenode(Oid relfilenode, SubTransactionId currentSubXid)
 {
 	if (WriteStateMap == NULL)
 	{
-		return;
+		return false;
 	}
 
 	WriteStateMapEntry *entry = hash_search(WriteStateMap, &relfilenode, HASH_FIND, NULL);
 
 	Assert(!entry || !entry->dropped);
 
+	bool flushedAny = false;
 	if (entry && entry->writeStateStack != NULL)
 	{
 		SubXidWriteState *stackEntry = entry->writeStateStack;
 		if (stackEntry->subXid == currentSubXid)
 		{
-			ColumnarFlushPendingWrites(stackEntry->writeState);
+			flushedAny = ColumnarFlushPendingWrites(stackEntry->writeState);
 		}
 	}
+
+	return flushedAny;
 }
 
 
