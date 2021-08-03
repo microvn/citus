@@ -565,7 +565,9 @@ static bool
 columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 								  Snapshot snapshot)
 {
-	return true;
+	uint64 rowNumber = tid_to_row_number(slot->tts_tid);
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(rel, rowNumber, snapshot);
+	return stripeMetadata != NULL;
 }
 
 
