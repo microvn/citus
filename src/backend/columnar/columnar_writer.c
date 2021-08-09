@@ -44,6 +44,7 @@ struct ColumnarWriteState
 	StripeBuffers *stripeBuffers;
 	StripeSkipList *stripeSkipList;
 	uint64 stripeFirstRowNumber;
+	uint64 stripeId;
 	ColumnarOptions options;
 	ChunkData *chunkData;
 
@@ -131,6 +132,7 @@ ColumnarBeginWrite(RelFileNode relfilenode,
 	writeState->stripeBuffers = NULL;
 	writeState->stripeSkipList = NULL;
 	writeState->stripeFirstRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
+	writeState->stripeId = 0; /* TODO: better to have an invalid value */
 	writeState->stripeWriteContext = stripeWriteContext;
 	writeState->chunkData = chunkData;
 	writeState->compressionBuffer = NULL;
@@ -164,6 +166,10 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *columnValues, bool *colu
 	ChunkData *chunkData = writeState->chunkData;
 	MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
 
+	Oid relationId = RelidByRelfilenode(writeState->relfilenode.spcNode,
+										writeState->relfilenode.relNode);
+	Relation relation = relation_open(relationId, NoLock);
+
 	if (stripeBuffers == NULL)
 	{
 		stripeBuffers = CreateEmptyStripeBuffers(options->stripeRowCount,
@@ -174,13 +180,12 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *columnValues, bool *colu
 		writeState->stripeSkipList = stripeSkipList;
 		writeState->compressionBuffer = makeStringInfo();
 
-		Oid relationId = RelidByRelfilenode(writeState->relfilenode.spcNode,
-											writeState->relfilenode.relNode);
-		Relation relation = relation_open(relationId, NoLock);
 		writeState->stripeFirstRowNumber =
 			ColumnarStorageReserveRowNumber(relation,
 											options->stripeRowCount);
-		relation_close(relation, NoLock);
+		writeState->stripeId = ReserveStripe(relation, columnCount,
+											 writeState->stripeFirstRowNumber,
+											 chunkRowCount);
 
 		/*
 		 * serializedValueBuffer lives in stripe write memory context so it needs to be
@@ -246,6 +251,8 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *columnValues, bool *colu
 	}
 
 	MemoryContextSwitchTo(oldContext);
+
+	relation_close(relation, NoLock);
 
 	return writtenRowNumber;
 }
@@ -380,7 +387,6 @@ CreateEmptyStripeSkipList(uint32 stripeMaxRowCount, uint32 chunkRowCount,
 static void
 FlushStripe(ColumnarWriteState *writeState)
 {
-	StripeMetadata stripeMetadata = { 0 };
 	uint32 columnIndex = 0;
 	uint32 chunkIndex = 0;
 	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
@@ -446,11 +452,11 @@ FlushStripe(ColumnarWriteState *writeState)
 		}
 	}
 
-	stripeMetadata = ReserveStripe(relation, stripeSize,
-								   stripeRowCount, columnCount, chunkCount,
-								   chunkRowCount, writeState->stripeFirstRowNumber);
+	StripeMetadata *stripeMetadata =
+		CompleteStripeReservation(relation, writeState->stripeId, stripeSize,
+								  stripeRowCount, chunkCount);
 
-	uint64 currentFileOffset = stripeMetadata.fileOffset;
+	uint64 currentFileOffset = stripeMetadata->fileOffset;
 
 	/*
 	 * Each stripe has only one section:
@@ -491,10 +497,10 @@ FlushStripe(ColumnarWriteState *writeState)
 	}
 
 	SaveChunkGroups(writeState->relfilenode,
-					stripeMetadata.id,
+					stripeMetadata->id,
 					writeState->chunkGroupRowCounts);
 	SaveStripeSkipList(writeState->relfilenode,
-					   stripeMetadata.id,
+					   stripeMetadata->id,
 					   stripeSkipList, tupleDescriptor);
 
 	writeState->chunkGroupRowCounts = NIL;

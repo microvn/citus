@@ -174,8 +174,8 @@ step s1-verify-metadata:
       -- verify that table has two stripes ..
       count(*) = 2 AND
       -- .. and those stripes look like:
-      sum(case when stripe_num = 1 AND first_row_number = 150001 AND row_count = 3 then 1 end) = 1 AND
-      sum(case when stripe_num = 2 AND first_row_number = 1 AND row_count = 10000 then 1 end) = 1
+      sum(case when stripe_num = 2 AND first_row_number = 150001 AND row_count = 3 then 1 end) = 1 AND
+      sum(case when stripe_num = 1 AND first_row_number = 1 AND row_count = 10000 then 1 end) = 1
       AS stripe_metadata_for_test_insert_concurrency_ok
     FROM test_insert_concurrency_stripes;
 

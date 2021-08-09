@@ -522,9 +522,60 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 	}
 
 	uint64 rowNumber = tid_to_row_number(*tid);
+	StripeMetadata *stripeMetadata =
+		StripeMetadataLookupRowNumber(scan->cs_base.rel, rowNumber,
+									  snapshot, FIND_LESS_OR_EQUAL);
+	if (!stripeMetadata)
+	{
+		/* it is certain that no such tuple exists */
+		return false;
+	}
+
+	if (!StripeIsFlushed(stripeMetadata))
+	{
+		/*
+		 * Stripe not flushed yet, block until it is done or writer xact is
+		 * roll-back'ed.
+		 */
+		TransactionId xwait = InvalidTransactionId;
+		if (TransactionIdIsValid(snapshot->xmin))
+		{
+			xwait = snapshot->xmin;
+		}
+		else if (TransactionIdIsValid(snapshot->xmax))
+		{
+			xwait = snapshot->xmax;
+		}
+		else
+		{
+			/*
+			 * TODO: can't wait for invalid xact id, XactLockTableWait doesn't
+			 * expect this either. So, what to do here ?
+			 * i)   Should we assume tuple exists and and just return true ?
+			 * ii)  Should we assume tuple doesn't exist at all and return
+			 *      false ?
+			 * iii) Or should this be never the case for columnar so return
+			 *      an error to be on the safe side ?
+			 */
+			ereport(ERROR, (errmsg("an error message :(")));
+		}
+
+		/* TODO: not sure if doing that is valid ... */
+		RESUME_INTERRUPTS();
+		XactLockTableWait(xwait, scan->cs_base.rel, tid, XLTW_InsertIndex);
+		HOLD_INTERRUPTS();
+	}
+
 	if (!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber, slot->tts_values,
 									slot->tts_isnull))
 	{
+		/*
+		 * StripeMetadataLookupRowNumber doesn't verify upper row number
+		 * boundary of found stripe. For this reason, we still don't certainly
+		 * know if given row number is living in one of the stripes.
+		 * Even more, even if that row number was belonging to a stripe, writer
+		 * xact might be roll-back'ed while we were blocked on XactLockTableWait.
+		 */
 		return false;
 	}
 
@@ -1364,7 +1415,8 @@ ColumnarGetHighestItemPointer(Relation relation, Snapshot snapshot)
 {
 	StripeMetadata *stripeWithHighestRowNumber =
 		FindStripeWithHighestRowNumber(relation, snapshot);
-	if (stripeWithHighestRowNumber == NULL)
+	if (stripeWithHighestRowNumber == NULL ||
+		StripeGetHighestRowNumber(stripeWithHighestRowNumber) == 0)
 	{
 		/* table is empty according to our snapshot */
 		ItemPointerData invalidItemPtr;

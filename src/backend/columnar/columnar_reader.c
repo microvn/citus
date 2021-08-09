@@ -272,6 +272,19 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 			return false;
 		}
 
+		if (!StripeIsFlushed(stripeMetadata))
+		{
+			/*
+			 * Callers are expected to skip stripes that are not flushed to
+			 * disk yet or should wait for the writer xact to commit or abort,
+			 * but let's be on the safe side.
+			 */
+			ereport(ERROR, (errmsg("unflushed stripe (" UINT64_FORMAT
+								   ") found while reading columnar table %s",
+								   stripeMetadata->id,
+								   RelationGetRelationName(columnarRelation))));
+		}
+
 		/* do the cleanup before reading a new stripe */
 		ColumnarResetRead(readState);
 
@@ -536,6 +549,24 @@ AdvanceStripeRead(ColumnarReadState *readState)
 	readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
 																 lastReadRowNumber,
 																 readState->snapshot);
+	while (readState->currentStripeMetadata &&
+		   !StripeIsFlushed(readState->currentStripeMetadata))
+	{
+		/*
+		 * TODO: comment
+		 * TODO: This is problematic, we should not assume that amount of
+		 *       wasted row numbers is equal to current options.stripeRowLimit.
+		 *       Instead, we should start do look-up's based on stripeId as
+		 *       before, not based on firstRowNumber.
+		 */
+		uint64 fakeLastReadRowNumber =
+			readState->currentStripeMetadata->firstRowNumber +
+			GetColumnarTableStripeRowLimit(RelationGetRelid(readState->relation));
+		readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
+																	 fakeLastReadRowNumber,
+																	 readState->snapshot);
+	}
+
 	readState->stripeReadState = NULL;
 	MemoryContextReset(readState->stripeReadContext);
 }

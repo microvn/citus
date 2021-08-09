@@ -237,17 +237,36 @@ extern const char * CompressionTypeStr(CompressionType type);
 extern void InitColumnarOptions(Oid regclass);
 extern void SetColumnarOptions(Oid regclass, ColumnarOptions *options);
 extern bool DeleteColumnarTableOptions(Oid regclass, bool missingOk);
+extern uint64 GetColumnarTableStripeRowLimit(Oid regclass);
 extern bool ReadColumnarOptions(Oid regclass, ColumnarOptions *options);
 extern bool IsColumnarTableAmTable(Oid relationId);
 
 /* columnar_metadata_tables.c */
+
+/* RowNumberLookupMode to be used in StripeMetadataLookupRowNumber */
+typedef enum RowNumberLookupMode
+{
+	/*
+	 * Find the stripe whose firstRowNumber is less than or equal to given
+	 * input rowNumber.
+	 */
+	FIND_LESS_OR_EQUAL,
+
+	/*
+	 * Find the stripe whose firstRowNumber is greater than input rowNumber.
+	 */
+	FIND_GREATER
+} RowNumberLookupMode;
+
 extern void DeleteMetadataRows(RelFileNode relfilenode);
 extern uint64 ColumnarMetadataNewStorageId(void);
 extern uint64 GetHighestUsedAddress(RelFileNode relfilenode);
-extern StripeMetadata ReserveStripe(Relation rel, uint64 size,
-									uint64 rowCount, uint64 columnCount,
-									uint64 chunkCount, uint64 chunkGroupRowCount,
-									uint64 stripeFirstRowNumber);
+extern uint64 ReserveStripe(Relation rel, uint64 columnCount,
+							uint64 stripeFirstRowNumber,
+							uint64 chunkGroupRowCount);
+extern StripeMetadata * CompleteStripeReservation(Relation rel, uint64 stripeId,
+												  uint64 sizeBytes, uint64 rowCount,
+												  uint64 chunkCount);
 extern void SaveStripeSkipList(RelFileNode relfilenode, uint64 stripe,
 							   StripeSkipList *stripeSkipList,
 							   TupleDesc tupleDescriptor);
@@ -261,7 +280,11 @@ extern StripeMetadata * FindNextStripeByRowNumber(Relation relation, uint64 rowN
 												  Snapshot snapshot);
 extern StripeMetadata * FindStripeByRowNumber(Relation relation, uint64 rowNumber,
 											  Snapshot snapshot);
+extern bool StripeIsFlushed(StripeMetadata *stripeMetadata);
 extern uint64 StripeGetHighestRowNumber(StripeMetadata *stripeMetadata);
+extern StripeMetadata * StripeMetadataLookupRowNumber(Relation relation, uint64 rowNumber,
+													  Snapshot snapshot,
+													  RowNumberLookupMode lookupMode);
 extern StripeMetadata * FindStripeWithHighestRowNumber(Relation relation,
 													   Snapshot snapshot);
 extern Datum columnar_relation_storageid(PG_FUNCTION_ARGS);
