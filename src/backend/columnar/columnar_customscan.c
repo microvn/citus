@@ -65,6 +65,10 @@ static void RecostColumnarSeqPath(RelOptInfo *rel, Oid relationId, Path *path);
 static int RelationIdGetNumberOfAttributes(Oid relationId);
 static void AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel,
 								 RangeTblEntry *rte);
+static void AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel,
+									RangeTblEntry *rte, Relids requiredRelids,
+									Relids remainingRelids,
+									int prevNumClauses);
 static CustomPath * CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
 										   RangeTblEntry *rte, Relids required_relids);
 static Cost ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead);
@@ -494,10 +498,71 @@ RelationIdGetNumberOfAttributes(Oid relationId)
 static void
 AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-	Relids required_relids = rel->lateral_relids;
+	Relids requiredRelids = rel->lateral_relids;
+	Relids remainingRelids = bms_difference(root->all_baserels, rel->relids);
+
+	/*
+	 * XXX: could avoid creating and discarding too many useless paths by
+	 * pre-filtering remainingRelids.
+	 */
+
+	AddColumnarScanPathsRec(root, rel, rte, requiredRelids, remainingRelids,
+							-1);
+}
+
+
+static void
+AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+						Relids requiredRelids, Relids remainingRelids,
+						int prevNumClauses)
+{
 	CustomPath *customPath = CreateColumnarScanPath(root, rel, rte,
-													required_relids);
+													requiredRelids);
+
+	/* find the number of join clauses for this path */
+	int numClauses = 0;
+	if (customPath->path.param_info != NULL)
+	{
+		numClauses = list_length(customPath->path.param_info->ppi_clauses);
+	}
+
+	/*
+	 * If adding a new relid to the parameterization added new clauses, then
+	 * add the path and recurse. Otherwise discard it.
+	 */
+	if (numClauses <= prevNumClauses)
+	{
+		pfree(customPath);
+		return;
+	}
+
 	add_path(rel, (Path *) customPath);
+
+	/* recurse for all remainingRelids */
+
+	/* make local copies so we don't scribble on the caller's data */
+	Relids iterateRelids = bms_copy(remainingRelids);
+	requiredRelids = bms_copy(requiredRelids);
+	remainingRelids = bms_copy(remainingRelids);
+
+	int relid;
+	while ((relid = bms_first_member(iterateRelids)) >= 0)
+	{
+		/* temporarily move relid from remainingRelids to requiredRelids */
+		requiredRelids = bms_add_member(requiredRelids, relid);
+		remainingRelids = bms_del_member(remainingRelids, relid);
+
+		AddColumnarScanPathsRec(root, rel, rte, requiredRelids,
+								remainingRelids, numClauses);
+
+		/* move back for next iteration */
+		requiredRelids = bms_del_member(requiredRelids, relid);
+		remainingRelids = bms_add_member(remainingRelids, relid);
+	}
+
+	bms_free(iterateRelids);
+	bms_free(requiredRelids);
+	bms_free(remainingRelids);
 }
 
 
@@ -676,11 +741,9 @@ ColumnarScanPath_PlanCustomPath(PlannerInfo *root,
 
 	cscan->methods = &ColumnarScanScanMethods;
 
-	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
-	clauses = extract_actual_clauses(clauses, false);
+	cscan->custom_exprs = copyObject(best_path->custom_private);
 
 	cscan->scan.plan.targetlist = list_copy(tlist);
-	cscan->scan.plan.qual = clauses;
 	cscan->scan.scanrelid = best_path->path.parent->relid;
 
 	return (Plan *) cscan;
@@ -698,7 +761,7 @@ ColumnarScan_CreateCustomScanState(CustomScan *cscan)
 
 	if (EnableColumnarQualPushdown)
 	{
-		columnarScanState->qual = cscan->scan.plan.qual;
+		columnarScanState->qual = copyObject(cscan->custom_exprs);
 	}
 
 	return (Node *) cscanstate;
