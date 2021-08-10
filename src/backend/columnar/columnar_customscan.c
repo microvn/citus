@@ -42,6 +42,7 @@ typedef struct ColumnarScanState
 	CustomScanState custom_scanstate; /* must be first field */
 
 	List *qual;
+	ExprContext *css_RuntimeContext;
 } ColumnarScanState;
 
 
@@ -771,6 +772,17 @@ ColumnarScan_CreateCustomScanState(CustomScan *cscan)
 static void
 ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int eflags)
 {
+	ColumnarScanState *columnarScanState = (ColumnarScanState *) cscanstate;
+	ExprContext *stdecontext = cscanstate->ss.ps.ps_ExprContext;
+
+	/*
+	 * Make a new ExprContext just like the existing one, except that we don't
+	 * reset it every tuple.
+	 */
+	ExecAssignExprContext(estate, &cscanstate->ss.ps);
+	columnarScanState->css_RuntimeContext = cscanstate->ss.ps.ps_ExprContext;
+	cscanstate->ss.ps.ps_ExprContext = stdecontext;
+
 	/* scan slot is already initialized */
 }
 
