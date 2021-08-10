@@ -66,7 +66,7 @@ static int RelationIdGetNumberOfAttributes(Oid relationId);
 static void AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel,
 								 RangeTblEntry *rte);
 static CustomPath * CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
-										   RangeTblEntry *rte);
+										   RangeTblEntry *rte, Relids required_relids);
 static Cost ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead);
 static Cost ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId,
 									  int numberOfColumnsRead);
@@ -494,13 +494,16 @@ RelationIdGetNumberOfAttributes(Oid relationId)
 static void
 AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-	CustomPath *customPath = CreateColumnarScanPath(root, rel, rte);
+	Relids required_relids = rel->lateral_relids;
+	CustomPath *customPath = CreateColumnarScanPath(root, rel, rte,
+													required_relids);
 	add_path(rel, (Path *) customPath);
 }
 
 
 static CustomPath *
-CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+					   Relids required_relids)
 {
 	/*
 	 * Must return a CustomPath, not a larger structure containing a
@@ -522,13 +525,43 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* columnar scans are not parallel-aware, but they are parallel-safe */
 	path->parallel_safe = rel->consider_parallel;
 
-	/*
-	 * We don't support pushing join clauses into the quals of a seqscan, but
-	 * it could still have required parameterization due to LATERAL refs in
-	 * its tlist.
-	 */
 	path->param_info = get_baserel_parampathinfo(root, rel,
-												 rel->lateral_relids);
+												 required_relids);
+
+	/*
+	 * Now, baserestrictinfo contains the clauses referencing only this rel,
+	 * and ppi_clauses (if present) represents the join clauses that reference
+	 * this rel and rels contained in required_relids (after accounting for
+	 * ECs). Combine the two lists of clauses, extracting the actual clause
+	 * from the rinfo, and filtering out pseudoconstants and SAOPs.
+	 */
+	List *allClauses = rel->baserestrictinfo;
+	if (path->param_info != NULL)
+	{
+		allClauses = list_concat(allClauses, path->param_info->ppi_clauses);
+	}
+	
+	List *pushClauses = NIL;
+	ListCell *lc;
+	foreach (lc, allClauses)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (rinfo->pseudoconstant ||
+			IsA(rinfo->clause, ScalarArrayOpExpr))
+		{
+			continue;
+		}
+
+		pushClauses = lappend(pushClauses, rinfo->clause);
+	}
+
+	/*
+	 * This is the set of clauses that can be pushed down for this
+	 * parameterization (with the given required_relids), and will be used to
+	 * construct the CustomScan plan.
+	 */
+	cpath->custom_private = copyObject(pushClauses);
 
 	/*
 	 * Add cost estimates for a columnar table scan, row count is the rows estimated by
