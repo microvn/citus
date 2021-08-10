@@ -63,8 +63,10 @@ static Cost ColumnarIndexScanAddTotalCost(PlannerInfo *root, RelOptInfo *rel,
 										  Oid relationId, IndexPath *indexPath);
 static void RecostColumnarSeqPath(RelOptInfo *rel, Oid relationId, Path *path);
 static int RelationIdGetNumberOfAttributes(Oid relationId);
-static Path * CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
-									 RangeTblEntry *rte);
+static void AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel,
+								 RangeTblEntry *rte);
+static CustomPath * CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
+										   RangeTblEntry *rte);
 static Cost ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead);
 static Cost ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId,
 									  int numberOfColumnsRead);
@@ -202,8 +204,6 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 		if (EnableColumnarCustomScan)
 		{
-			Path *customPath = CreateColumnarScanPath(root, rel, rte);
-
 			ereport(DEBUG1, (errmsg("pathlist hook for columnar table am")));
 
 			/*
@@ -220,7 +220,7 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			 * SeqPath thinking that its cost would be equal to ColumnarCustomScan.
 			 */
 			RemovePathsByPredicate(rel, IsNotIndexPath);
-			add_path(rel, customPath);
+			AddColumnarScanPaths(root, rel, rte);
 		}
 	}
 	RelationClose(relation);
@@ -491,7 +491,15 @@ RelationIdGetNumberOfAttributes(Oid relationId)
 }
 
 
-static Path *
+static void
+AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	CustomPath *customPath = CreateColumnarScanPath(root, rel, rte);
+	add_path(rel, (Path *) customPath);
+}
+
+
+static CustomPath *
 CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	/*
@@ -532,7 +540,7 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	path->total_cost = path->startup_cost +
 					   ColumnarScanCost(rel, rte->relid, numberOfColumnsRead);
 
-	return (Path *) cpath;
+	return cpath;
 }
 
 
