@@ -517,7 +517,7 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 						int prevNumClauses)
 {
 	CustomPath *customPath = CreateColumnarScanPath(root, rel, rte,
-													requiredRelids);
+													bms_copy(requiredRelids));
 
 	/* find the number of join clauses for this path */
 	int numClauses = 0;
@@ -568,7 +568,7 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 static CustomPath *
 CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
-					   Relids required_relids)
+					   Relids requiredRelids)
 {
 	/*
 	 * Must return a CustomPath, not a larger structure containing a
@@ -591,12 +591,12 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	path->parallel_safe = rel->consider_parallel;
 
 	path->param_info = get_baserel_parampathinfo(root, rel,
-												 required_relids);
+												 requiredRelids);
 
 	/*
 	 * Now, baserestrictinfo contains the clauses referencing only this rel,
 	 * and ppi_clauses (if present) represents the join clauses that reference
-	 * this rel and rels contained in required_relids (after accounting for
+	 * this rel and rels contained in requiredRelids (after accounting for
 	 * ECs). Combine the two lists of clauses, extracting the actual clause
 	 * from the rinfo, and filtering out pseudoconstants and SAOPs.
 	 */
@@ -623,7 +623,7 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 	/*
 	 * This is the set of clauses that can be pushed down for this
-	 * parameterization (with the given required_relids), and will be used to
+	 * parameterization (with the given requiredRelids), and will be used to
 	 * construct the CustomScan plan.
 	 */
 	cpath->custom_private = copyObject(pushClauses);
