@@ -16,7 +16,8 @@
 
 #include "access/amapi.h"
 #include "access/skey.h"
-#include "nodes/extensible.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
 #include "optimizer/cost.h"
@@ -24,6 +25,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/lsyscache.h"
 #include "utils/relcache.h"
 #include "utils/spccache.h"
 
@@ -41,8 +43,8 @@ typedef struct ColumnarScanState
 {
 	CustomScanState custom_scanstate; /* must be first field */
 
-	List *qual;
 	ExprContext *css_RuntimeContext;
+	List *qual;
 } ColumnarScanState;
 
 
@@ -72,7 +74,7 @@ static void AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel,
 									int prevNumClauses);
 static CustomPath * CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
 										   RangeTblEntry *rte, Relids required_relids);
-static Cost ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead);
+static Cost ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead, int nClauses);
 static Cost ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId,
 									  int numberOfColumnsRead);
 static uint64 ColumnarTableStripeCount(Oid relationId);
@@ -478,7 +480,7 @@ RecostColumnarSeqPath(RelOptInfo *rel, Oid relationId, Path *path)
 	 */
 	int numberOfColumnsRead = RelationIdGetNumberOfAttributes(relationId);
 	path->total_cost = path->startup_cost +
-					   ColumnarScanCost(rel, relationId, numberOfColumnsRead);
+		ColumnarScanCost(rel, relationId, numberOfColumnsRead, 0);
 }
 
 
@@ -637,7 +639,8 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	path->startup_cost = 0;
 	int numberOfColumnsRead = bms_num_members(rte->selectedCols);
 	path->total_cost = path->startup_cost +
-					   ColumnarScanCost(rel, rte->relid, numberOfColumnsRead);
+		ColumnarScanCost(rel, rte->relid, numberOfColumnsRead,
+						 list_length(pushClauses));
 
 	return cpath;
 }
@@ -649,9 +652,9 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * need to be read.
  */
 static Cost
-ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead)
+ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead, int nClauses)
 {
-	return ColumnarTableStripeCount(relationId) *
+	return ((double)ColumnarTableStripeCount(relationId)/nClauses) *
 		   ColumnarPerStripeScanCost(rel, relationId, numberOfColumnsRead);
 }
 
@@ -760,18 +763,61 @@ ColumnarScan_CreateCustomScanState(CustomScan *cscan)
 	CustomScanState *cscanstate = &columnarScanState->custom_scanstate;
 	cscanstate->methods = &ColumnarScanExecuteMethods;
 
-	if (EnableColumnarQualPushdown)
+	return (Node *) cscanstate;
+}
+
+
+static Node *
+EvalParamsMutator(Node *node, ExprContext *econtext)
+{
+	if (node == NULL)
 	{
-		columnarScanState->qual = copyObject(cscan->custom_exprs);
+		return NULL;
 	}
 
-	return (Node *) cscanstate;
+	if (IsA(node, Param))
+	{
+		Param   *param = (Param *)node;
+		int16    typLen;
+		bool     typByVal;
+		Datum    pval;
+		bool     isnull;
+
+		get_typlenbyval(param->paramtype, &typLen, &typByVal);
+
+		ExprState *exprState = ExecInitExprWithParams((Expr*) node, econtext->ecxt_param_list_info);
+		pval = ExecEvalExpr(exprState, econtext, &isnull);
+
+		return (Node *) makeConst(param->paramtype,
+								  param->paramtypmod,
+								  param->paramcollid,
+								  (int) typLen,
+								  pval,
+								  isnull,
+								  typByVal);
+	}
+
+	return expression_tree_mutator(node, EvalParamsMutator, (void *) econtext);
+}
+
+
+static List *
+EvaluateClauseParams(ExprContext *econtext, List *clauses)
+{
+	if (!EnableColumnarQualPushdown)
+	{
+		return NIL;
+	}
+
+	return (List *) expression_tree_mutator(
+		(Node *) clauses, EvalParamsMutator, econtext);
 }
 
 
 static void
 ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int eflags)
 {
+	CustomScan *cscan = (CustomScan *) cscanstate->ss.ps.plan;
 	ColumnarScanState *columnarScanState = (ColumnarScanState *) cscanstate;
 	ExprContext *stdecontext = cscanstate->ss.ps.ps_ExprContext;
 
@@ -784,6 +830,10 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 	cscanstate->ss.ps.ps_ExprContext = stdecontext;
 
 	/* scan slot is already initialized */
+
+	/* bind parameters from the econtext so quals can be pushed down */
+	columnarScanState->qual = EvaluateClauseParams(
+		columnarScanState->css_RuntimeContext, cscan->custom_exprs);
 }
 
 
@@ -925,7 +975,15 @@ ColumnarScan_EndCustomScan(CustomScanState *node)
 static void
 ColumnarScan_ReScanCustomScan(CustomScanState *node)
 {
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	ColumnarScanState *columnarScanState = (ColumnarScanState *) node;
+
+	ResetExprContext(columnarScanState->css_RuntimeContext);
+	EvaluateClauseParams(columnarScanState->css_RuntimeContext,
+						 cscan->custom_exprs);
+
 	TableScanDesc scanDesc = node->ss.ss_currentScanDesc;
+
 	if (scanDesc != NULL)
 	{
 		table_rescan(node->ss.ss_currentScanDesc, NULL);
