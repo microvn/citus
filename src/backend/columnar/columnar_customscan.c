@@ -14,6 +14,8 @@
 
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/amapi.h"
 #include "access/skey.h"
 #include "nodes/makefuncs.h"
@@ -68,7 +70,7 @@ static void RecostColumnarSeqPath(RelOptInfo *rel, Oid relationId, Path *path);
 static int RelationIdGetNumberOfAttributes(Oid relationId);
 static void AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel,
 								 RangeTblEntry *rte);
-static void AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel,
+static bool AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel,
 									RangeTblEntry *rte, Relids requiredRelids,
 									Relids remainingRelids,
 									int prevNumClauses);
@@ -498,6 +500,10 @@ RelationIdGetNumberOfAttributes(Oid relationId)
 }
 
 
+/*
+ * AddColumnarScanPaths is the entry point for recursively generating
+ * parameterized paths. See AddColumnarScanPathsRec() for discussion.
+ */
 static void
 AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -514,7 +520,28 @@ AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 }
 
 
-static void
+/*
+ * AddColumnarScanPathsRec is a recursive function to search the
+ * parameterization space and add ColumnarScanPaths.
+ *
+ * Columnar tables resemble indexes because of the ability to push down
+ * quals. Ordinary quals, such as x = 7, can be pushed down easily. But join
+ * quals of the form "Var op Var" (where the relids of the two Vars are
+ * different) take more work and require the proper parameterization.
+ *
+ * Paths that require more outer rels can push down more join clauses that
+ * depend on those outer rels. But requiring outer rels gives the planner
+ * fewer options for the shape of the plan, so there is a trade-off. We always
+ * need to generate one minimally-parameterized path (parameterized only by
+ * lateral refs, if present) to make sure that at least one path can be
+ * chosen. Then, we generate as many useful parameterized paths as we
+ * reasonably can.
+ *
+ * The set of all possible parameterizations is the power set of
+ * remainingRelids. The power set has cardinality 2^N, where N is the
+ * cardinality of remainingRelids. XXX: do more to handle the worst cases.
+ */
+static bool
 AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 						Relids requiredRelids, Relids remainingRelids,
 						int prevNumClauses)
@@ -530,13 +557,19 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	}
 
 	/*
+	 * Adding extra required relids should not decrease the number of join
+	 * clauses we can push down.
+	 */
+	Assert(numClauses >= prevNumClauses);
+
+	/*
 	 * If adding a new relid to the parameterization added new clauses, then
 	 * add the path and recurse. Otherwise discard it.
 	 */
-	if (numClauses <= prevNumClauses)
+	if (numClauses == prevNumClauses)
 	{
 		pfree(customPath);
-		return;
+		return false;
 	}
 
 	add_path(rel, (Path *) customPath);
@@ -555,20 +588,31 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		requiredRelids = bms_add_member(requiredRelids, relid);
 		remainingRelids = bms_del_member(remainingRelids, relid);
 
-		AddColumnarScanPathsRec(root, rel, rte, requiredRelids,
-								remainingRelids, numClauses);
+		bool useful = AddColumnarScanPathsRec(root, rel, rte, requiredRelids,
+											  remainingRelids, numClauses);
 
-		/* move back for next iteration */
+		/*
+		 * Move back for next iteration, or discard if the relid was
+		 * useless.
+		 */
 		requiredRelids = bms_del_member(requiredRelids, relid);
-		remainingRelids = bms_add_member(remainingRelids, relid);
+		if (useful)
+		{
+			remainingRelids = bms_add_member(remainingRelids, relid);
+		}
 	}
 
 	bms_free(iterateRelids);
 	bms_free(requiredRelids);
 	bms_free(remainingRelids);
+
+	return true;
 }
 
 
+/*
+ * Create a path with the given parameterization requiredRelids.
+ */
 static CustomPath *
 CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					   Relids requiredRelids)
@@ -608,7 +652,7 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	{
 		allClauses = list_concat(allClauses, path->param_info->ppi_clauses);
 	}
-	
+
 	List *pushClauses = NIL;
 	ListCell *lc;
 	foreach (lc, allClauses)
@@ -654,7 +698,18 @@ CreateColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 static Cost
 ColumnarScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead, int nClauses)
 {
-	return ((double)ColumnarTableStripeCount(relationId)/nClauses) *
+	double stripesToRead = ColumnarTableStripeCount(relationId);
+
+	/*
+	 * XXX: we don't currently have a good way of estimating the selectivity
+	 * of the clauses for chunk group filtering. For now, just assume the
+	 * selectivity of each clause is 0.75. In the future, we can use
+	 * correlation statistics or even just read the metadata directly (though
+	 * the join clauses will have Params and be harder to estimate).
+	 */
+	stripesToRead *= pow(0.75, nClauses);
+
+	return stripesToRead *
 		   ColumnarPerStripeScanCost(rel, relationId, numberOfColumnsRead);
 }
 
@@ -785,6 +840,7 @@ EvalParamsMutator(Node *node, ExprContext *econtext)
 
 		get_typlenbyval(param->paramtype, &typLen, &typByVal);
 
+		/* XXX: should save ExprState for efficiency */
 		ExprState *exprState = ExecInitExprWithParams((Expr*) node, econtext->ecxt_param_list_info);
 		pval = ExecEvalExpr(exprState, econtext, &isnull);
 
@@ -801,6 +857,10 @@ EvalParamsMutator(Node *node, ExprContext *econtext)
 }
 
 
+/*
+ * EvaluateClauseParams simply replaces Params with Consts in clauses using
+ * econtext.
+ */
 static List *
 EvaluateClauseParams(ExprContext *econtext, List *clauses)
 {
