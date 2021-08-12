@@ -75,7 +75,7 @@ static void CheckPartitionColumn(Oid relationId, Node *whereClause);
 static List * ShardsMatchingDeleteCriteria(Oid relationId, List *shardList,
 										   Node *deleteCriteria);
 static int DropShards(Oid relationId, char *schemaName, char *relationName,
-					  List *deletableShardIntervalList);
+					  List *deletableShardIntervalList, bool drop_shards_metadata_only);
 static List * DropTaskList(Oid relationId, char *schemaName, char *relationName,
 						   List *deletableShardIntervalList);
 static void ExecuteDropShardPlacementCommandRemotely(ShardPlacement *shardPlacement,
@@ -193,8 +193,10 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 																  deleteCriteria);
 	}
 
+	bool drop_shards_metadata_only = false;
 	int droppedShardCount = DropShards(relationId, schemaName, relationName,
-									   deletableShardIntervalList);
+									   deletableShardIntervalList,
+									   drop_shards_metadata_only);
 
 	PG_RETURN_INT32(droppedShardCount);
 }
@@ -213,6 +215,7 @@ citus_drop_all_shards(PG_FUNCTION_ARGS)
 	Oid relationId = PG_GETARG_OID(0);
 	text *schemaNameText = PG_GETARG_TEXT_P(1);
 	text *relationNameText = PG_GETARG_TEXT_P(2);
+	bool drop_shards_metadata_only = PG_GETARG_BOOL(3);
 
 	char *schemaName = text_to_cstring(schemaNameText);
 	char *relationName = text_to_cstring(relationNameText);
@@ -239,7 +242,7 @@ citus_drop_all_shards(PG_FUNCTION_ARGS)
 
 	List *shardIntervalList = LoadShardIntervalList(relationId);
 	int droppedShardCount = DropShards(relationId, schemaName, relationName,
-									   shardIntervalList);
+									   shardIntervalList, drop_shards_metadata_only);
 
 	PG_RETURN_INT32(droppedShardCount);
 }
@@ -251,7 +254,25 @@ citus_drop_all_shards(PG_FUNCTION_ARGS)
 Datum
 master_drop_all_shards(PG_FUNCTION_ARGS)
 {
-	return citus_drop_all_shards(fcinfo);
+	Oid relationId = PG_GETARG_OID(0);
+	text *schemaNameText = PG_GETARG_TEXT_P(1);
+	text *relationNameText = PG_GETARG_TEXT_P(2);
+	bool drop_shards_metadata_only = false;
+
+	LOCAL_FCINFO(local_fcinfo, 4);
+
+	InitFunctionCallInfoData(*local_fcinfo, NULL, 4, InvalidOid, NULL, NULL);
+
+	local_fcinfo->args[0].value = ObjectIdGetDatum(relationId);
+	local_fcinfo->args[0].isnull = false;
+	local_fcinfo->args[1].value = PointerGetDatum(schemaNameText);
+	local_fcinfo->args[1].isnull = false;
+	local_fcinfo->args[2].value = PointerGetDatum(relationNameText);
+	local_fcinfo->args[2].isnull = false;
+	local_fcinfo->args[3].value = BoolGetDatum(drop_shards_metadata_only);
+	local_fcinfo->args[3].isnull = false;
+
+	return citus_drop_all_shards(local_fcinfo);
 }
 
 
@@ -299,10 +320,13 @@ CheckTableSchemaNameForDrop(Oid relationId, char **schemaName, char **tableName)
  *
  * We mark shard placements that we couldn't drop as to be deleted later, but
  * we do delete the shard metadadata.
+ *
+ * If drop_shards_metadata_only is true, then we don't send remote commands to drop the shards:
+ * we only remove pg_dist_placement and pg_dist_shard rows.
  */
 static int
 DropShards(Oid relationId, char *schemaName, char *relationName,
-		   List *deletableShardIntervalList)
+		   List *deletableShardIntervalList, bool drop_shards_metadata_only)
 {
 	Assert(OidIsValid(relationId));
 	Assert(schemaName != NULL);
@@ -362,13 +386,14 @@ DropShards(Oid relationId, char *schemaName, char *relationName,
 			 * If it is a local placement of a distributed table or a reference table,
 			 * then execute the DROP command locally.
 			 */
-			if (isLocalShardPlacement && shouldExecuteTasksLocally)
+			if (isLocalShardPlacement && shouldExecuteTasksLocally &&
+				!drop_shards_metadata_only)
 			{
 				List *singleTaskList = list_make1(task);
 
 				ExecuteLocalUtilityTaskList(singleTaskList);
 			}
-			else
+			else if (!drop_shards_metadata_only)
 			{
 				/*
 				 * Either it was not a local placement or we could not use
